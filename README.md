@@ -6,3 +6,4 @@ go run ./cmd/node --port=7003
 
 
 ### add resp parser
+ncat localhost 7001

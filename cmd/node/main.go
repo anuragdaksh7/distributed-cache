@@ -2,7 +2,7 @@ package main
 
 import (
 	"bufio"
-	"bytes"
+	"distributed-redis/resp"
 	"flag"
 	"fmt"
 	"net"
@@ -68,76 +68,112 @@ func handleConnection(conn net.Conn) {
 
 	fmt.Println("Connected: ", conn.RemoteAddr())
 
-	scanner := bufio.NewScanner(conn)
+	reader := bufio.NewReader(conn)
 
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		cmd, err := parse(line)
+	for {
+		args, err := resp.Parse(reader)
 		if err != nil {
-			conn.Write([]byte("ERR " + err.Error() + "\n"))
-			continue
+			return
 		}
 
-		response := execute(cmd)
+		fmt.Println("Received:", args)
 
-		conn.Write([]byte(response + "\n"))
+		execute(args, conn)
 	}
 
 	fmt.Println("Disconnected: ", conn.RemoteAddr())
 }
+func execute(args []string, conn net.Conn) {
+	if len(args) == 0 {
+		resp.WriteError(conn, "empty command")
+		return
+	}
 
-func execute(cmd Command) string {
-	switch cmd.Name {
+	cmd := strings.ToUpper(args[0])
+
+	switch cmd {
+
 	case "PING":
-		return "PONG"
+		resp.WriteSimpleString(conn, "PONG")
+
+	case "AUTH":
+		// Ignore authentication for now.
+		resp.WriteSimpleString(conn, "OK")
+
+	case "CLIENT":
+		// CLIENT SETNAME ...
+		resp.WriteSimpleString(conn, "OK")
+
+	case "HELLO":
+		// Minimal implementation.
+		resp.WriteSimpleString(conn, "OK")
+
+	case "INFO":
+		info := `# Server
+redis_version:7.2.0
+
+# Replication
+role:master
+
+# Cluster
+cluster_enabled:0
+`
+		resp.WriteBulkString(conn, info)
+
 	case "GET":
-		if len(cmd.Args) != 1 {
-			return "ERR GET key"
+		if len(args) != 2 {
+			resp.WriteError(conn, "wrong number of arguments for 'get' command")
+			return
 		}
 
 		cache.mu.RLock()
-		value, ok := cache.data[cmd.Args[0]]
+		value, ok := cache.data[args[1]]
 		cache.mu.RUnlock()
 
 		if !ok {
-			return "(nil)"
+			resp.WriteNull(conn)
+			return
 		}
 
-		return string(value)
+		resp.WriteBulkString(conn, string(value)+"\r\n")
+
 	case "SET":
-		if len(cmd.Args) != 2 {
-			return "ERR SET key value"
+		if len(args) != 3 {
+			resp.WriteError(conn, "wrong number of arguments for 'set' command")
+			return
 		}
 
 		cache.mu.Lock()
-		cache.data[cmd.Args[0]] = []byte(cmd.Args[1])
+		cache.data[args[1]] = []byte(args[2])
 		cache.mu.Unlock()
 
-		return "OK"
+		resp.WriteSimpleString(conn, "OK")
+
 	case "DEL":
-		if len(cmd.Args) != 1 {
-			return "ERR DEL key"
+		if len(args) != 2 {
+			resp.WriteError(conn, "wrong number of arguments for 'del' command")
+			return
 		}
 
 		cache.mu.Lock()
-		delete(cache.data, cmd.Args[0])
+		delete(cache.data, args[1])
 		cache.mu.Unlock()
 
-		return "OK"
+		resp.WriteInteger(conn, 1)
+
 	case "KEYS":
 		cache.mu.RLock()
-		defer cache.mu.RUnlock()
 
-		var b bytes.Buffer
-
+		keys := make([]string, 0, len(cache.data))
 		for k := range cache.data {
-			b.WriteString(k)
-			b.WriteByte(' ')
+			keys = append(keys, k)
 		}
 
-		return b.String()
+		cache.mu.RUnlock()
+
+		resp.WriteArray(conn, keys)
+
 	default:
-		return "ERR unknown command: " + cmd.Name
+		resp.WriteError(conn, "unknown command '"+strings.ToLower(cmd)+"'")
 	}
 }
