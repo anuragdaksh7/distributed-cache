@@ -50,7 +50,7 @@ func main() {
 	}
 	defer listner.Close()
 
-	fmt.Println("Listening on :7001")
+	fmt.Println("Listening on :" + addr)
 
 	for {
 		conn, err := listner.Accept()
@@ -135,7 +135,7 @@ cluster_enabled:0
 			return
 		}
 
-		resp.WriteBulkString(conn, string(value)+"\r\n")
+		resp.WriteBulkString(conn, string(value))
 
 	case "SET":
 		if len(args) != 3 {
@@ -172,6 +172,22 @@ cluster_enabled:0
 		cache.mu.RUnlock()
 
 		resp.WriteArray(conn, keys)
+
+	case "CONFIG":
+		if len(args) >= 3 && strings.ToUpper(args[1]) == "GET" {
+			resp.WriteArray(conn, []string{
+				"databases",
+				"1",
+			})
+			return
+		}
+
+	case "DBSIZE":
+		cache.mu.RLock()
+		n := len(cache.data)
+		cache.mu.RUnlock()
+
+		resp.WriteInteger(conn, n)
 
 	default:
 		resp.WriteError(conn, "unknown command '"+strings.ToLower(cmd)+"'")

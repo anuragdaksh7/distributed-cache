@@ -5,7 +5,6 @@ import (
 	"distributed-redis/resp"
 	"fmt"
 	"hash/fnv"
-	"io"
 	"net"
 	"strings"
 )
@@ -22,21 +21,6 @@ type Router struct {
 type Command struct {
 	Name string
 	Args []string
-}
-
-func parse(line string) (Command, error) {
-	fields := strings.Fields(line)
-
-	if len(fields) == 0 {
-		return Command{}, fmt.Errorf("empty command")
-	}
-
-	cmd := Command{
-		Name: strings.ToUpper(fields[0]),
-		Args: fields[1:],
-	}
-
-	return cmd, nil
 }
 
 func GetKey(args []string) (string, error) {
@@ -85,14 +69,22 @@ func (r *Router) Handle(client net.Conn) {
 		}
 
 		fmt.Println(args)
+		cmd := strings.ToUpper(args[0])
 
-		key, err := GetKey(args)
-		if err != nil {
-			return
+		fmt.Printf("%#v\n", args)
+		switch cmd {
+		case "KEYS":
+			err = r.ForwardAll(args, client)
+		default:
+			key, err := GetKey(args)
+			if err != nil {
+				return
+			}
+
+			node := r.GetNode(key)
+			err = r.Forward(node, args, client)
 		}
 
-		node := r.GetNode(key)
-		err = r.Forward(node, args, client)
 		if err != nil {
 			client.Write([]byte("ERR node unavailable\n"))
 			continue
@@ -122,8 +114,48 @@ func (r *Router) Handle(client net.Conn) {
 	//}
 }
 
-func (r *Router) Forward(node Node, args []string, client net.Conn) error {
+func (r *Router) KeysFromNode(node Node) ([]string, error) {
+	conn, err := net.Dial("tcp", node.Address)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
 
+	// Send KEYS command
+	resp.WriteArray(conn, []string{"KEYS"})
+
+	reader := bufio.NewReader(conn)
+
+	b, err := reader.Peek(1024)
+	fmt.Printf("%q\n", b)
+
+	// Parse RESP array returned by the node
+	keys, err := resp.Parse(reader)
+	if err != nil {
+		return nil, err
+	}
+
+	return keys, nil
+}
+
+func (r *Router) ForwardAll(args []string, client net.Conn) error {
+	var allKeys []string
+
+	for _, node := range r.Nodes {
+
+		keys, err := r.KeysFromNode(node)
+		if err != nil {
+			return err
+		}
+
+		allKeys = append(allKeys, keys...)
+	}
+
+	resp.WriteArray(client, allKeys)
+	return nil
+}
+
+func (r *Router) Forward(node Node, args []string, client net.Conn) error {
 	conn, err := net.Dial("tcp", node.Address)
 	if err != nil {
 		return err
@@ -132,9 +164,9 @@ func (r *Router) Forward(node Node, args []string, client net.Conn) error {
 
 	resp.WriteArray(conn, args)
 
-	_, err = io.Copy(client, conn)
+	reader := bufio.NewReader(conn)
 
-	return err
+	return resp.ForwardValue(reader, client)
 }
 
 func main() {
@@ -146,7 +178,7 @@ func main() {
 		},
 	}
 
-	listener, _ := net.Listen("tcp", ":6379")
+	listener, _ := net.Listen("tcp", ":6380")
 
 	for {
 
