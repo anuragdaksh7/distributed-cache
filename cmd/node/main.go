@@ -24,21 +24,6 @@ type Command struct {
 	Args []string
 }
 
-func parse(line string) (Command, error) {
-	fields := strings.Fields(line)
-
-	if len(fields) == 0 {
-		return Command{}, fmt.Errorf("empty command")
-	}
-
-	cmd := Command{
-		Name: strings.ToUpper(fields[0]),
-		Args: fields[1:],
-	}
-
-	return cmd, nil
-}
-
 func main() {
 	port := flag.Int("port", 7001, "TCP port")
 	flag.Parse()
@@ -107,6 +92,29 @@ func execute(args []string, conn net.Conn) {
 	case "HELLO":
 		// Minimal implementation.
 		resp.WriteSimpleString(conn, "OK")
+
+	case "SCAN":
+		if len(args) < 2 {
+			resp.WriteError(conn, "wrong number of arguments for 'scan' command")
+			return
+		}
+
+		cache.mu.RLock()
+
+		keys := make([]string, 0, len(cache.data))
+
+		for k := range cache.data {
+			keys = append(keys, k)
+		}
+
+		cache.mu.RUnlock()
+
+		// Ignore MATCH and COUNT for now
+		resp.WriteScan(
+			conn,
+			"0",
+			keys,
+		)
 
 	case "INFO":
 		info := `# Server

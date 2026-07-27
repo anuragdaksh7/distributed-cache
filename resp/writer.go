@@ -38,3 +38,27 @@ func WriteArray(conn net.Conn, arr []string) {
 		WriteBulkString(conn, s)
 	}
 }
+
+func WriteNestedArray(conn net.Conn, values [][]string) {
+
+	fmt.Fprintf(conn, "*%d\r\n", len(values))
+
+	for _, arr := range values {
+		WriteArray(conn, arr)
+	}
+}
+
+func WriteScan(conn net.Conn, cursor string, keys []string) {
+
+	// outer array size = 2
+	fmt.Fprintf(conn, "*2\r\n")
+
+	// cursor
+	fmt.Fprintf(conn, "$%d\r\n%s\r\n",
+		len(cursor),
+		cursor,
+	)
+
+	// keys array
+	WriteArray(conn, keys)
+}
