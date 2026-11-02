@@ -5,6 +5,18 @@ import (
 	"net"
 )
 
+func WriteCommand(conn net.Conn, args []string) error {
+	if _, err := fmt.Fprintf(conn, "*%d\r\n", len(args)); err != nil {
+		return err
+	}
+	for _, arg := range args {
+		if err := WriteBulkBytes(conn, []byte(arg)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func WriteSimpleString(conn net.Conn, s string) {
 	fmt.Fprintf(conn, "+%s\r\n", s)
 }
@@ -25,10 +37,15 @@ func WriteBulkString(conn net.Conn, s string) {
 	fmt.Fprintf(conn, "$%d\r\n%s\r\n", len(s), s)
 }
 
-func WriteBulkBytes(conn net.Conn, b []byte) {
-	fmt.Fprintf(conn, "$%d\r\n", len(b))
-	conn.Write(b)
-	conn.Write([]byte("\r\n"))
+func WriteBulkBytes(conn net.Conn, b []byte) error {
+	if _, err := fmt.Fprintf(conn, "$%d\r\n", len(b)); err != nil {
+		return err
+	}
+	if _, err := conn.Write(b); err != nil {
+		return err
+	}
+	_, err := conn.Write([]byte("\r\n"))
+	return err
 }
 
 func WriteArray(conn net.Conn, arr []string) {

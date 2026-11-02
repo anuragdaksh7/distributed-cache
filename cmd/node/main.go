@@ -19,26 +19,21 @@ var cache = Cache{
 	data: make(map[string][]byte),
 }
 
-type Command struct {
-	Name string
-	Args []string
-}
-
 func main() {
 	port := flag.Int("port", 7001, "TCP port")
 	flag.Parse()
 
 	addr := fmt.Sprintf(":%d", *port)
-	listner, err := net.Listen("tcp", addr)
+	listener, err := net.Listen("tcp", addr)
 	if err != nil {
 		panic(err)
 	}
-	defer listner.Close()
+	defer listener.Close()
 
 	fmt.Println("Listening on :" + addr)
 
 	for {
-		conn, err := listner.Accept()
+		conn, err := listener.Accept()
 		if err != nil {
 			fmt.Println("Error accepting connection:", err)
 			continue
@@ -60,13 +55,8 @@ func handleConnection(conn net.Conn) {
 		if err != nil {
 			return
 		}
-
-		fmt.Println("Received:", args)
-
 		execute(args, conn)
 	}
-
-	fmt.Println("Disconnected: ", conn.RemoteAddr())
 }
 func execute(args []string, conn net.Conn) {
 	if len(args) == 0 {
@@ -158,16 +148,22 @@ cluster_enabled:0
 		resp.WriteSimpleString(conn, "OK")
 
 	case "DEL":
-		if len(args) != 2 {
+		if len(args) < 2 {
 			resp.WriteError(conn, "wrong number of arguments for 'del' command")
 			return
 		}
 
 		cache.mu.Lock()
-		delete(cache.data, args[1])
+		deleted := 0
+		for _, key := range args[1:] {
+			if _, ok := cache.data[key]; ok {
+				deleted++
+				delete(cache.data, key)
+			}
+		}
 		cache.mu.Unlock()
 
-		resp.WriteInteger(conn, 1)
+		resp.WriteInteger(conn, deleted)
 
 	case "KEYS":
 		cache.mu.RLock()

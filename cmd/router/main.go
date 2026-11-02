@@ -2,188 +2,256 @@ package main
 
 import (
 	"bufio"
-	"distributed-redis/resp"
+	"flag"
 	"fmt"
-	"hash/fnv"
+	"hash/crc32"
 	"net"
+	"sort"
 	"strings"
+	"time"
+
+	"distributed-redis/resp"
 )
 
 type Node struct {
 	ID      int
 	Address string
 }
-
+type ringPoint struct {
+	hash uint32
+	node Node
+}
 type Router struct {
-	Nodes []Node
+	Nodes    []Node
+	Replicas int
+	points   []ringPoint
 }
 
-type Command struct {
-	Name string
-	Args []string
+func NewRouter(nodes []Node, replicas int) *Router {
+	if replicas < 1 {
+		replicas = 1
+	}
+	r := &Router{Nodes: nodes, Replicas: replicas}
+	for _, node := range nodes {
+		for i := 0; i < 128; i++ {
+			key := fmt.Sprintf("%s#%d", node.Address, i)
+			r.points = append(r.points, ringPoint{crc32.ChecksumIEEE([]byte(key)), node})
+		}
+	}
+	sort.Slice(r.points, func(i, j int) bool { return r.points[i].hash < r.points[j].hash })
+	return r
+}
+
+func (r *Router) GetNodes(key string) []Node {
+	if len(r.points) == 0 {
+		return nil
+	}
+	h := crc32.ChecksumIEEE([]byte(key))
+	start := sort.Search(len(r.points), func(i int) bool { return r.points[i].hash >= h })
+	if start == len(r.points) {
+		start = 0
+	}
+	seen := map[string]bool{}
+	var out []Node
+	for i := 0; i < len(r.points) && len(out) < r.Replicas; i++ {
+		n := r.points[(start+i)%len(r.points)].node
+		if !seen[n.Address] {
+			seen[n.Address] = true
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 func GetKey(args []string) (string, error) {
 	if len(args) == 0 {
 		return "", fmt.Errorf("empty command")
 	}
-
 	switch strings.ToUpper(args[0]) {
-
 	case "GET", "DEL":
 		if len(args) != 2 {
 			return "", fmt.Errorf("invalid command")
 		}
 		return args[1], nil
-
 	case "SET":
 		if len(args) < 3 {
 			return "", fmt.Errorf("invalid command")
 		}
 		return args[1], nil
-
 	default:
-		return "", nil // commands without keys
+		return "", nil
 	}
-}
-
-func (r *Router) GetNode(key string) Node {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-
-	index := h.Sum32() % uint32(len(r.Nodes))
-
-	return r.Nodes[index]
 }
 
 func (r *Router) Handle(client net.Conn) {
 	defer client.Close()
-
-	//scanner := bufio.NewScanner(client)
 	reader := bufio.NewReader(client)
-
 	for {
 		args, err := resp.Parse(reader)
 		if err != nil {
 			return
 		}
-
-		fmt.Println(args)
-		cmd := strings.ToUpper(args[0])
-
-		fmt.Printf("%#v\n", args)
-		switch cmd {
-		case "KEYS":
-			err = r.ForwardAll(args, client)
-		default:
-			key, err := GetKey(args)
-			if err != nil {
-				return
-			}
-
-			node := r.GetNode(key)
-			err = r.Forward(node, args, client)
-		}
-
-		if err != nil {
-			client.Write([]byte("ERR node unavailable\n"))
+		if len(args) == 0 {
+			resp.WriteError(client, "empty command")
 			continue
 		}
+		cmd := strings.ToUpper(args[0])
+		if cmd == "KEYS" || cmd == "SCAN" {
+			if err := r.ForwardAll(args, client); err != nil {
+				resp.WriteError(client, "node unavailable")
+			}
+			continue
+		}
+		key, err := GetKey(args)
+		if err != nil {
+			resp.WriteError(client, err.Error())
+			continue
+		}
+		if key == "" {
+			var forwarded bool
+			for _, node := range r.Nodes {
+				if err := r.Forward(node, args, client); err == nil {
+					forwarded = true
+					break
+				}
+			}
+			if !forwarded {
+				resp.WriteError(client, "node unavailable")
+			}
+			continue
+		}
+		owners := r.GetNodes(key)
+		if len(owners) == 0 {
+			resp.WriteError(client, "no nodes configured")
+			continue
+		}
+		if cmd == "GET" {
+			var ok bool
+			for _, node := range owners {
+				if err := r.Forward(node, args, client); err == nil {
+					ok = true
+					break
+				}
+			}
+			if !ok {
+				resp.WriteError(client, "node unavailable")
+			}
+			continue
+		}
+		var response []byte
+		live := 0
+		for _, node := range owners {
+			value, err := r.Request(node, args)
+			if err == nil {
+				live++
+				if response == nil {
+					response = value
+				}
+			}
+		}
+		if live == 0 {
+			resp.WriteError(client, "node unavailable")
+		} else {
+			_, _ = client.Write(response)
+		}
 	}
-
-	//for scanner.Scan() {
-	//	line := scanner.Text()
-	//
-	//	cmd, err := parse(line)
-	//	if err != nil {
-	//		client.Write([]byte("ERR invalid command\n"))
-	//		continue
-	//	}
-	//
-	//	key := cmd.Args[0]
-	//
-	//	node := r.GetNode(key)
-	//
-	//	response, err := r.Forward(node, line)
-	//	if err != nil {
-	//		client.Write([]byte("ERR node unavailable\n"))
-	//		continue
-	//	}
-	//
-	//	client.Write([]byte(response + "\n"))
-	//}
 }
 
-func (r *Router) KeysFromNode(node Node) ([]string, error) {
-	conn, err := net.Dial("tcp", node.Address)
+func (r *Router) Request(node Node, args []string) ([]byte, error) {
+	conn, err := net.DialTimeout("tcp", node.Address, 300*time.Millisecond)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
-
-	// Send KEYS command
-	resp.WriteArray(conn, []string{"KEYS"})
-
-	reader := bufio.NewReader(conn)
-
-	b, err := reader.Peek(1024)
-	fmt.Printf("%q\n", b)
-
-	// Parse RESP array returned by the node
-	keys, err := resp.Parse(reader)
-	if err != nil {
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if err := resp.WriteCommand(conn, args); err != nil {
 		return nil, err
 	}
-
-	return keys, nil
+	return resp.ReadValue(bufio.NewReader(conn))
 }
-
-func (r *Router) ForwardAll(args []string, client net.Conn) error {
-	var allKeys []string
-
-	for _, node := range r.Nodes {
-
-		keys, err := r.KeysFromNode(node)
-		if err != nil {
-			return err
-		}
-
-		allKeys = append(allKeys, keys...)
-	}
-
-	resp.WriteArray(client, allKeys)
-	return nil
-}
-
 func (r *Router) Forward(node Node, args []string, client net.Conn) error {
-	conn, err := net.Dial("tcp", node.Address)
+	b, err := r.Request(node, args)
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	_, err = client.Write(b)
+	return err
+}
 
-	resp.WriteArray(conn, args)
-
-	reader := bufio.NewReader(conn)
-
-	return resp.ForwardValue(reader, client)
+func (r *Router) ForwardAll(args []string, client net.Conn) error {
+	seen := map[string]bool{}
+	var keys []string
+	cursor := "0"
+	for _, node := range r.Nodes {
+		command := []string{"KEYS", "*"}
+		if strings.EqualFold(args[0], "SCAN") {
+			command = []string{"SCAN", "0"}
+			if len(args) > 2 {
+				command = append(command, args[2:]...)
+			}
+		}
+		b, err := r.Request(node, command)
+		if err != nil {
+			continue
+		}
+		value, err := resp.ParseValue(b)
+		if err != nil {
+			continue
+		}
+		if strings.EqualFold(args[0], "SCAN") {
+			if len(value.Array) > 0 {
+				cursor = value.Array[0].Text
+			}
+			if len(value.Array) > 1 {
+				for _, v := range value.Array[1].Array {
+					if !seen[v.Text] {
+						seen[v.Text] = true
+						keys = append(keys, v.Text)
+					}
+				}
+			}
+		} else {
+			for _, v := range value.Array {
+				if !seen[v.Text] {
+					seen[v.Text] = true
+					keys = append(keys, v.Text)
+				}
+			}
+		}
+	}
+	sort.Strings(keys)
+	if strings.EqualFold(args[0], "SCAN") {
+		resp.WriteScan(client, cursor, keys)
+	} else {
+		resp.WriteArray(client, keys)
+	}
+	return nil
 }
 
 func main() {
-	router := Router{
-		Nodes: []Node{
-			{ID: 1, Address: "localhost:7001"},
-			{ID: 2, Address: "localhost:7002"},
-			{ID: 3, Address: "localhost:7003"},
-		},
+	listen := flag.String("listen", ":6380", "router listen address")
+	nodeList := flag.String("nodes", "localhost:7001,localhost:7002,localhost:7003", "comma-separated storage nodes")
+	replicas := flag.Int("replicas", 2, "copies per key")
+	flag.Parse()
+	var nodes []Node
+	for i, address := range strings.Split(*nodeList, ",") {
+		address = strings.TrimSpace(address)
+		if address != "" {
+			nodes = append(nodes, Node{ID: i + 1, Address: address})
+		}
 	}
-
-	listener, _ := net.Listen("tcp", ":6380")
-
+	r := NewRouter(nodes, *replicas)
+	listener, err := net.Listen("tcp", *listen)
+	if err != nil {
+		panic(err)
+	}
+	defer listener.Close()
+	fmt.Printf("Listening on %s with %d nodes and %d replicas\n", *listen, len(nodes), *replicas)
 	for {
-
-		conn, _ := listener.Accept()
-
-		go router.Handle(conn)
+		conn, err := listener.Accept()
+		if err != nil {
+			continue
+		}
+		go r.Handle(conn)
 	}
 }
