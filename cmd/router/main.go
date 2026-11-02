@@ -8,6 +8,7 @@ import (
 	"net"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"distributed-redis/resp"
@@ -21,18 +22,27 @@ type ringPoint struct {
 	hash uint32
 	node Node
 }
+type backendConn struct {
+	mu     sync.Mutex
+	conn   net.Conn
+	reader *bufio.Reader
+}
 type Router struct {
 	Nodes    []Node
 	Replicas int
 	points   []ringPoint
+	backends map[string]*backendConn
 }
 
 func NewRouter(nodes []Node, replicas int) *Router {
 	if replicas < 1 {
 		replicas = 1
 	}
-	r := &Router{Nodes: nodes, Replicas: replicas}
+	r := &Router{Nodes: nodes, Replicas: replicas, backends: make(map[string]*backendConn, len(nodes))}
 	for _, node := range nodes {
+		if _, exists := r.backends[node.Address]; !exists {
+			r.backends[node.Address] = &backendConn{}
+		}
 		for i := 0; i < 128; i++ {
 			key := fmt.Sprintf("%s#%d", node.Address, i)
 			r.points = append(r.points, ringPoint{crc32.ChecksumIEEE([]byte(key)), node})
@@ -158,16 +168,32 @@ func (r *Router) Handle(client net.Conn) {
 }
 
 func (r *Router) Request(node Node, args []string) ([]byte, error) {
-	conn, err := net.DialTimeout("tcp", node.Address, 300*time.Millisecond)
-	if err != nil {
-		return nil, err
+	backend := r.backends[node.Address]
+	if backend == nil {
+		return nil, fmt.Errorf("unknown backend %q", node.Address)
 	}
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-	if err := resp.WriteCommand(conn, args); err != nil {
-		return nil, err
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	for attempt := 0; attempt < 2; attempt++ {
+		if backend.conn == nil {
+			conn, err := net.DialTimeout("tcp", node.Address, 500*time.Millisecond)
+			if err != nil {
+				return nil, err
+			}
+			backend.conn, backend.reader = conn, bufio.NewReader(conn)
+		}
+		_ = backend.conn.SetDeadline(time.Now().Add(5 * time.Second))
+		if err := resp.WriteCommand(backend.conn, args); err == nil {
+			value, err := resp.ReadValue(backend.reader)
+			if err == nil {
+				_ = backend.conn.SetDeadline(time.Time{})
+				return value, nil
+			}
+		}
+		_ = backend.conn.Close()
+		backend.conn, backend.reader = nil, nil
 	}
-	return resp.ReadValue(bufio.NewReader(conn))
+	return nil, fmt.Errorf("backend %s request failed", node.Address)
 }
 func (r *Router) Forward(node Node, args []string, client net.Conn) error {
 	b, err := r.Request(node, args)
